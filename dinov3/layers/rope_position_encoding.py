@@ -4,11 +4,18 @@
 # the terms of the DINOv3 License Agreement.
 
 import math
-from typing import Literal
+import dataclasses
+from typing import Literal, Optional
 
 import numpy as np
 import torch
 from torch import Tensor, nn
+
+
+@dataclasses.dataclass(frozen=True)
+class RopeParams:
+    scale: Optional[torch.Tensor] = None     # B
+    rotation: Optional[torch.Tensor] = None  # B
 
 
 # RoPE positional embedding with no mixing of coordinates (axial) and no learnable weights
@@ -54,7 +61,7 @@ class RopePositionEmbedding(nn.Module):
         )
         self._init_weights()
 
-    def forward(self, *, H: int, W: int) -> tuple[Tensor, Tensor]:
+    def forward(self, *, H: int, W: int, params: Optional[RopeParams] = None) -> tuple[Tensor, Tensor]:
         device = self.periods.device
         dtype = self.dtype
         dd = {"device": device, "dtype": dtype}
@@ -77,6 +84,18 @@ class RopePositionEmbedding(nn.Module):
         coords = coords.flatten(0, 1)  # [HW, 2]
         coords = 2.0 * coords - 1.0  # Shift range [0, 1] to [-1, +1]
 
+        if params is not None:  # Note: If params are applied per-sample then coords is Bx1xHWx2 instead of HWx2
+            if params.rotation is not None:
+                cos_rot = torch.cos(params.rotation)
+                sin_rot = torch.sin(params.rotation)
+                if params.scale is not None:
+                    cos_rot.mul_(params.scale)
+                    sin_rot.mul_(params.scale)
+                with torch.autocast(device_type=coords.device.type, enabled=False):
+                    coords = coords @ torch.stack(tensors=(cos_rot, sin_rot, -sin_rot, cos_rot), dim=-1).view(-1, 1, 2, 2)
+            elif params.scale is not None:
+                coords = coords * params.scale.view(-1, 1, 1, 1)
+
         # Shift coords by adding a uniform value in [-shift, shift]
         if self.training and self.shift_coords is not None:
             shift_hw = torch.empty(2, **dd).uniform_(-self.shift_coords, self.shift_coords)
@@ -97,13 +116,13 @@ class RopePositionEmbedding(nn.Module):
             coords *= rescale_hw
 
         # Prepare angles and sin/cos
-        angles = 2 * math.pi * coords[:, :, None] / self.periods[None, None, :]  # [HW, 2, D//4]
-        angles = angles.flatten(1, 2)  # [HW, D//2]
+        angles = 2 * math.pi * coords.unsqueeze(dim=-1) / self.periods  # [HW, 2, D//4]
+        angles = angles.flatten(-2, -1)  # [HW, D//2]
         angles = angles.tile(2)  # [HW, D]
         cos = torch.cos(angles)  # [HW, D]
         sin = torch.sin(angles)  # [HW, D]
 
-        return (sin, cos)  # 2 * [HW, D]
+        return (sin, cos)  # 2 * [HW, D] OR 2 * [B, 1, HW, D]
 
     def _init_weights(self):
         device = self.periods.device

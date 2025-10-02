@@ -11,7 +11,7 @@ import torch
 import torch.nn.init
 from torch import Tensor, nn
 
-from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
+from dinov3.layers import LayerScale, Mlp, PatchEmbed, RMSNorm, RopeParams, RopePositionEmbedding, SelfAttentionBlock, SwiGLUFFN
 from dinov3.utils import named_apply
 
 logger = logging.getLogger("dinov3")
@@ -219,16 +219,20 @@ class DinoVisionTransformer(nn.Module):
 
         return x, (H, W)
 
-    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
+    def forward_features_list(self, x_list: List[Tensor], masks_list: Optional[List[Optional[Tensor]]] = None, rope_params: Optional[List[Optional[RopeParams]]] = None) -> List[Dict[str, Tensor]]:
+        if masks_list is None:
+            masks_list = [None] * len(x_list)
+        if rope_params is None:
+            rope_params = [None] * len(x_list)
         x = []
         rope = []
-        for t_x, t_masks in zip(x_list, masks_list):
+        for t_x, t_masks in zip(x_list, masks_list, strict=True):
             t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
             x.append(t2_x)
             rope.append(hw_tuple)
         for _, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
-                rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
+                rope_sincos = [self.rope_embed(H=H, W=W, params=params) for (H, W), params in zip(rope, rope_params, strict=True)]
             else:
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
